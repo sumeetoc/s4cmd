@@ -1314,40 +1314,44 @@ class ThreadUtil(S3Handler, ThreadPool.Worker):
 
     # Initialization: Set up multithreaded uploads.
     if not mpi:
-      fsize = os.path.getsize(source)
-      md5cache = LocalMD5Cache(source)
-
-      # optional checks
-      if self.opt.dry_run:
-        message('%s => %s', source, target)
+      if not os.path.exists(source):
+        message('WARNING %s => %s (broken link)', source, target)
         return
-      elif self.opt.sync_check and self.sync_check(md5cache, obj):
-        message('%s => %s (synced)', source, target)
+      else:
+        fsize = os.path.getsize(source)
+        md5cache = LocalMD5Cache(source)
+
+        # optional checks
+        if self.opt.dry_run:
+          message('%s => %s', source, target)
+          return
+        elif self.opt.sync_check and self.sync_check(md5cache, obj):
+          message('%s => %s (synced)', source, target)
+          return
+        elif not self.opt.force and obj:
+          raise Failure('File already exists: %s' % target)
+
+        if fsize < self.opt.max_singlepart_upload_size:
+          data = self.read_file_chunk(source, 0, fsize)
+          self.s3.put_object(Bucket=s3url.bucket,
+                             Key=s3url.path,
+                             Body=data,
+                             Metadata={'md5': md5cache.get_md5(),
+                                       'privilege': self.get_file_privilege(source)})
+          message('%s => %s', source, target)
+          return
+
+        # Here we need to have our own md5 value because multipart upload calculates
+        # different md5 values.
+        response = self.s3.create_multipart_upload(Bucket=s3url.bucket,
+                                                   Key=s3url.path,
+                                                   Metadata={'md5': md5cache.get_md5(),
+                                                             'privilege': self.get_file_privilege(source)})
+        upload_id = response['UploadId']
+
+        for args in self.get_file_splits(upload_id, source, target, fsize, self.opt.multipart_split_size):
+          self.pool.upload(*args)
         return
-      elif not self.opt.force and obj:
-        raise Failure('File already exists: %s' % target)
-
-      if fsize < self.opt.max_singlepart_upload_size:
-        data = self.read_file_chunk(source, 0, fsize)
-        self.s3.put_object(Bucket=s3url.bucket,
-                           Key=s3url.path,
-                           Body=data,
-                           Metadata={'md5': md5cache.get_md5(),
-                                     'privilege': self.get_file_privilege(source)})
-        message('%s => %s', source, target)
-        return
-
-      # Here we need to have our own md5 value because multipart upload calculates
-      # different md5 values.
-      response = self.s3.create_multipart_upload(Bucket=s3url.bucket,
-                                                 Key=s3url.path,
-                                                 Metadata={'md5': md5cache.get_md5(),
-                                                           'privilege': self.get_file_privilege(source)})
-      upload_id = response['UploadId']
-
-      for args in self.get_file_splits(upload_id, source, target, fsize, self.opt.multipart_split_size):
-        self.pool.upload(*args)
-      return
 
     data = self.read_file_chunk(source, pos, chunk)
     response = self.s3.upload_part(Bucket=s3url.bucket, Key=s3url.path, UploadId=mpi.id, Body=data, PartNumber=part)
